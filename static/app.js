@@ -786,7 +786,62 @@ const draftResultView = createResultView(document.getElementById("draft-result-s
 draftResultView.clear();
 
 let cachedRecipes = [];
-let viewedDraft = null; // 当前查看的草稿（携带其版本用于归档）
+
+// ---- 炉次详情的请求编排状态 ----
+// selectedDraftId：点击「查看 / 刷新」瞬间选定的炉次（同步生效，等待时可再切换）
+// viewedDraft：最近一次“成功读回”的详情；归档只绑定它点击瞬间的 id 与 version
+// detailSeq：详情读取的单调序号，只有“当前选择的最新请求”允许写详情/曲线/提示/按钮
+// detailLoading：当前选择的最新读取尚未成功读回（其间归档按钮禁用）
+// archivePending：已提交归档、尚未落定的炉次 id 集合（同一炉次不得重复提交）
+let selectedDraftId = null;
+let viewedDraft = null;
+let detailSeq = 0;
+let detailLoading = false;
+let listSeq = 0;
+const archivePending = new Set();
+
+const archiveBtn = document.getElementById("draft-archive-btn");
+const refreshBtn = document.getElementById("draft-refresh-btn");
+const detailTitle = document.getElementById("draft-detail-title");
+const detailError = document.getElementById("draft-detail-error");
+const detailOk = document.getElementById("draft-detail-ok");
+
+function showDetailError(msg) {
+  detailError.textContent = msg;
+  detailError.hidden = false;
+}
+
+function showDetailOk(msg) {
+  detailOk.textContent = msg;
+  detailOk.hidden = false;
+}
+
+function hideDetailTips() {
+  detailError.hidden = true;
+  detailOk.hidden = true;
+}
+
+// 归档按钮只表达“当前选择”的状态：读取中 / 该炉归档中 / 已冻结 / 可归档
+function syncArchiveButton() {
+  const id = selectedDraftId;
+  const loaded = viewedDraft && viewedDraft.id === id;
+  if (detailLoading) {
+    archiveBtn.disabled = true;
+    archiveBtn.textContent = "读取中…";
+  } else if (id != null && archivePending.has(id)) {
+    archiveBtn.disabled = true;
+    archiveBtn.textContent = "归档中…";
+  } else if (!loaded) {
+    archiveBtn.disabled = true;
+    archiveBtn.textContent = "核准归档";
+  } else if (viewedDraft.status === "archived") {
+    archiveBtn.disabled = true;
+    archiveBtn.textContent = "已归档（方案已冻结）";
+  } else {
+    archiveBtn.disabled = false;
+    archiveBtn.textContent = `核准归档（携带版本 v${viewedDraft.version}）`;
+  }
+}
 
 async function loadRecipesIntoRefs() {
   const { ok, data } = await api("/api/recipes");
@@ -853,14 +908,22 @@ draftForm.addEventListener("submit", async (ev) => {
 });
 
 async function loadDrafts() {
+  // 列表读取同样有序号保护：旧回包不得覆盖更新的列表
+  const seq = ++listSeq;
+  let resp;
+  try {
+    resp = await api("/api/drafts");
+  } catch (e) {
+    return; // 列表后台刷新失败不打扰详情区，可下次再试
+  }
+  if (seq !== listSeq) return;
   const tbody = document.querySelector("#drafts-table tbody");
   tbody.innerHTML = "";
-  const { ok, data } = await api("/api/drafts");
-  const drafts = ok ? data : [];
+  const drafts = resp.ok ? resp.data : [];
   document.getElementById("draft-empty").hidden = drafts.length !== 0;
   const recipesById = new Map(cachedRecipes.map((r) => [r.id, r]));
   drafts.forEach((d) => {
-    const tr = el("tr", { class: viewedDraft && viewedDraft.id === d.id ? "row-selected" : "" });
+    const tr = el("tr", { class: selectedDraftId === d.id ? "row-selected" : "" });
     tr.appendChild(el("td", { textContent: String(d.id) }));
     tr.appendChild(el("td", { textContent: d.name || "—" }));
     tr.appendChild(el("td", {
@@ -879,6 +942,7 @@ async function loadDrafts() {
       class: d.solvable ? "" : "text-fail",
     }));
     tr.appendChild(el("td", { class: "ts", textContent: fmtTime(d.updatedAt) }));
+    // 等待详情/归档期间仍可随时切换炉次
     const viewBtn = el("button", { class: "btn-secondary btn-small", type: "button", textContent: "查看" });
     viewBtn.addEventListener("click", () => openDraft(d.id));
     tr.appendChild(el("td", {}, viewBtn));
@@ -886,44 +950,89 @@ async function loadDrafts() {
   });
 }
 
-async function openDraft(id) {
-  const card = draftDetailCard;
-  card.hidden = false;
-  const { ok, status, data } = await api(`/api/drafts/${id}`);
-  if (!ok) {
-    showDraftDetailError(detailOf(data));
+// 查看或刷新一发起：目标立即切换、旧详情立即失去归档资格；
+// 只有当前选择的最新请求（seq）允许写详情、曲线、提示与按钮。
+// preserveReason=true 用于 409/422 后的同一炉次重读：保留可见原因。
+async function openDraft(id, preserveReason = false) {
+  const seq = ++detailSeq;
+  const sameTarget = selectedDraftId === id;
+  selectedDraftId = id;
+  // 查看或刷新一发起，旧详情立即失去归档资格（成功读回后才由 renderDraftDetail 恢复）
+  viewedDraft = null;
+  detailLoading = true;
+  draftDetailCard.hidden = false;
+  refreshBtn.disabled = true;
+  refreshBtn.textContent = "读取中…";
+  syncArchiveButton();
+  loadDrafts();
+
+  if (!sameTarget) {
+    // 切到另一炉次：旧炉次的曲线与提示立即离场，绝不允许旧响应改写这里
+    detailTitle.textContent = `炉次 #${id} 读取中…`;
+    draftMeta.innerHTML = "";
+    draftResultView.clear();
+    hideDetailTips();
+  } else if (!preserveReason) {
+    // 手动刷新：清掉旧的成功提示；失败原因由 preserveReason 控制保留
+    detailOk.hidden = true;
+  }
+
+  let resp;
+  try {
+    resp = await api(`/api/drafts/${id}`);
+  } catch (e) {
+    if (seq !== detailSeq || selectedDraftId !== id) return; // 旧请求的网络异常：忽略
+    detailLoading = false;
+    refreshBtn.disabled = false;
+    refreshBtn.textContent = "刷新";
+    syncArchiveButton();
+    if (preserveReason && !detailError.hidden) {
+      detailError.textContent += "（自动刷新未完成：无法连接后端服务，可点「刷新」重试。）";
+    } else {
+      showDetailError(`炉次 #${id} 读取失败：无法连接后端服务，请检查网络后点「刷新」重试。`);
+    }
     return;
   }
-  renderDraftDetail(data);
-  if (card.scrollIntoView) card.scrollIntoView({ behavior: "smooth", block: "start" });
+
+  // 旧请求（成功或 HTTP 失败）一律不得干扰当前选择
+  if (seq !== detailSeq || selectedDraftId !== id) return;
+  detailLoading = false;
+  refreshBtn.disabled = false;
+  refreshBtn.textContent = "刷新";
+
+  if (!resp.ok) {
+    syncArchiveButton();
+    const failMsg = detailOf(resp.data);
+    if (preserveReason && !detailError.hidden) {
+      // 刷新失败时保留此前可见的原因
+      detailError.textContent += `（自动刷新未完成：${failMsg}，可点「刷新」重试。）`;
+    } else {
+      showDetailError(failMsg);
+    }
+    return;
+  }
+
+  // 成功读回：旧详情到此才重新获得（按新状态的）归档资格
+  // preserveReason 场景下（409/422 后的同炉重读），失败原因继续可见
+  renderDraftDetail(resp.data, { keepError: preserveReason });
+  if (draftDetailCard.scrollIntoView) draftDetailCard.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
-function showDraftDetailError(msg) {
-  const e = document.getElementById("draft-detail-error");
-  e.textContent = msg;
-  e.hidden = false;
-}
-
-function renderDraftDetail(d) {
+function renderDraftDetail(d, { keepError = false, keepOk = false } = {}) {
   viewedDraft = d;
-  document.getElementById("draft-detail-error").hidden = true;
-  document.getElementById("draft-detail-ok").hidden = true;
-  document.getElementById("draft-detail-title").textContent =
-    `炉次 #${d.id} ${d.name || "（未命名）"}`;
+  detailError.hidden = keepError ? detailError.hidden : true;
+  detailOk.hidden = !keepOk;
+  detailTitle.textContent = `炉次 #${d.id} ${d.name || "（未命名）"}`;
 
-  const archiveBtn = document.getElementById("draft-archive-btn");
-  archiveBtn.disabled = d.status === "archived";
-  archiveBtn.textContent = d.status === "archived"
-    ? "已归档（方案已冻结）"
-    : `核准归档（携带版本 v${d.version}）`;
+  syncArchiveButton();
 
   draftMeta.innerHTML = "";
   draftMeta.appendChild(kv("状态", d.status === "archived" ? "已归档（冻结）" : "活动"));
   draftMeta.appendChild(kv("草稿版本", `v${d.version}`));
   draftMeta.appendChild(kv("按顺序引用配方", d.recipeIds
-    .map((id) => {
-      const rv = d.recipeVersions[String(id)];
-      return `#${id}${rv ? `（引用时 v${rv}）` : ""}`;
+    .map((rid) => {
+      const rv = d.recipeVersions[String(rid)];
+      return `#${rid}${rv ? `（引用时 v${rv}）` : ""}`;
     })
     .join(" → ")));
   draftMeta.appendChild(kv("求解", d.solvable ? `有解，${d.result.stepCount} 档 / ${d.result.totalMinutes} 分钟` : "无解"));
@@ -951,50 +1060,72 @@ function renderDraftDetail(d) {
   loadDrafts();
 }
 
-document.getElementById("draft-refresh-btn").addEventListener("click", async () => {
-  if (!viewedDraft) return;
-  await openDraft(viewedDraft.id);
+refreshBtn.addEventListener("click", () => {
+  if (selectedDraftId == null || detailLoading) return;
+  openDraft(selectedDraftId);
 });
 
-document.getElementById("draft-archive-btn").addEventListener("click", async () => {
-  if (!viewedDraft || viewedDraft.status === "archived") return;
-  const okMsg = document.getElementById("draft-detail-ok");
-  const errEl = document.getElementById("draft-detail-error");
-  okMsg.hidden = true;
-  errEl.hidden = true;
-  const btn = document.getElementById("draft-archive-btn");
-  btn.disabled = true;
+archiveBtn.addEventListener("click", async () => {
+  // 绑定“点击时”的炉次 id 与 version，与之后的切换、刷新互不串改
+  const target = viewedDraft;
+  if (!target || selectedDraftId !== target.id || target.status === "archived") return;
+  if (detailLoading || archivePending.has(target.id)) return; // 同炉次归档未结束不得重复提交
+
+  const archiveId = target.id;
+  const archiveVersion = target.version;
+  archivePending.add(archiveId);
+  syncArchiveButton();
+  hideDetailTips();
+
+  let r;
   try {
-    const r = await api(`/api/drafts/${viewedDraft.id}/archive`, {
+    r = await api(`/api/drafts/${archiveId}/archive`, {
       method: "POST",
-      body: JSON.stringify({ version: viewedDraft.version }),
+      body: JSON.stringify({ version: archiveVersion }),
     });
-    if (r.status === 409) {
-      const cur = r.data.detail && r.data.detail.currentVersion;
-      errEl.textContent =
-        detailOf(r.data) + (cur ? ` 已为你重新载入当前版本 v${cur}。` : "");
-      errEl.hidden = false;
-      // 过期：重新读取，呈现最新参数 + 结果，绝不混用
-      await openDraft(viewedDraft.id);
-      return;
-    }
-    if (!r.ok) {
-      // 422：当前无解等；状态未改变
-      errEl.textContent = "归档失败（未改变任何状态）：" + detailOf(r.data);
-      errEl.hidden = false;
-      await openDraft(viewedDraft.id);
-      return;
-    }
-    okMsg.textContent = `归档成功：已冻结炉次 #${r.data.id} 的版本 v${r.data.version} 材料参数与完整求解结果；此后配方修改不再影响本炉次。`;
-    okMsg.hidden = false;
-    renderDraftDetail(r.data);
-    return; // 已归档：保持按钮禁用
   } catch (e) {
-    errEl.textContent = "无法连接后端服务，请确认服务已启动。";
-    errEl.hidden = false;
-    btn.disabled = false;
+    archivePending.delete(archiveId);
+    loadDrafts(); // 服务端可能已归档成功：静默同步列表
+    // 网络异常：只有仍停留在发起时的炉次才提示，可刷新/重试
+    if (selectedDraftId === archiveId && !detailLoading) {
+      showDetailError("归档请求未能完成：无法连接后端服务。该炉次可能已归档，请点「刷新」读取最新状态后再试。");
+      syncArchiveButton();
+    }
+    return;
   }
+
+  archivePending.delete(archiveId);
+
+  // 回包期间已切到别的炉次：本次成功/失败都不得改写乙的详情或提示，
+  // 只静默同步列表（已提交的甲归档照常生效；乙加载后按自身状态操作）
+  if (selectedDraftId !== archiveId) {
+    loadDrafts();
+    return;
+  }
+  // 停留在同一炉次、但期间又发起了新的读取（刷新/切回）：交给那次读取呈现
+  if (detailLoading) return;
+
+  if (r.status === 409) {
+    const cur = r.data.detail && r.data.detail.currentVersion;
+    // 保留可见原因，并刷新同一炉次到当前版本（绝不混用旧参数 + 新结果）
+    showDetailError(detailOf(r.data) + (cur ? ` 已重新载入当前版本 v${cur}（见下方最新方案）。` : " 已重新读取最新状态。"));
+    await openDraft(archiveId, true);
+    return;
+  }
+  if (!r.ok) {
+    // 422（当前无解）等失败：状态未改变；保留原因并刷新同一炉次
+    showDetailError("归档失败（未改变任何状态）：" + detailOf(r.data));
+    await openDraft(archiveId, true);
+    return;
+  }
+
+  // 成功：留在原炉次，显示冻结方案与成功提示，按钮保持禁用
+  showDetailOk(`归档成功：已冻结炉次 #${r.data.id} 的版本 v${r.data.version} 材料参数与完整求解结果；此后配方修改不再影响本炉次。`);
+  renderDraftDetail(r.data, { keepOk: true });
 });
+
+// 初始：尚未成功读回任何炉次，归档按钮禁用
+syncArchiveButton();
 
 // ---------- 启动 ----------
 buildRows();
